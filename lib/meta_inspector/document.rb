@@ -1,53 +1,87 @@
-# -*- encoding: utf-8 -*-
-
 module MetaInspector
   # A MetaInspector::Document knows about its URL and its contents
   class Document
-    attr_reader :timeout, :html_content_only, :allow_redirections, :warn_level
+    attr_reader :allow_non_html_content, :allow_redirections, :headers
 
-    include MetaInspector::Exceptionable
-
-    # Initializes a new instance of MetaInspector::Document, setting the URL to the one given
+    # Initializes a new instance of MetaInspector::Document, setting the URL
     # Options:
-    # => timeout: defaults to 20 seconds
-    # => html_content_type_only: if an exception should be raised if request content-type is not text/html. Defaults to false
-    # => allow_redirections: when :safe, allows HTTP => HTTPS redirections. When :all, it also allows HTTPS => HTTP
-    # => document: the html of the url as a string
-    # => warn_level: what to do when encountering exceptions. Can be :warn, :raise or nil
+    # * connection_timeout: defaults to 20 seconds
+    # * read_timeout: defaults to 20 seconds
+    # * retries: defaults to 3 times
+    # * allow_redirections: when true, follow HTTP redirects. Defaults to true
+    # * document: the html of the url as a string
+    # * headers: object containing custom headers for the request
+    # * normalize_url: true by default
+    # * faraday_options: an optional hash of options to pass to Faraday on the request
     def initialize(initial_url, options = {})
       options             = defaults.merge(options)
-      @timeout            = options[:timeout]
-      @html_content_only  = options[:html_content_only]
-      @allow_redirections = options[:allow_redirections]
+      @connection_timeout = options[:connection_timeout]
+      @read_timeout       = options[:read_timeout]
+      @retries            = options[:retries]
+      @encoding           = options[:encoding]
+
+      @allow_redirections     = options[:allow_redirections]
+      @allow_non_html_content = options[:allow_non_html_content]
+
       @document           = options[:document]
-      @warn_level         = options[:warn_level]
-      @exception_log      = options[:exception_log] || MetaInspector::ExceptionLog.new(warn_level: warn_level)
-      @url                = MetaInspector::URL.new(initial_url, exception_log: @exception_log)
-      @request            = MetaInspector::Request.new(@url,  allow_redirections: @allow_redirections,
-                                                              timeout:            @timeout,
-                                                              exception_log:      @exception_log) unless @document
-      @parser             = MetaInspector::Parser.new(self,  exception_log:      @exception_log)
+      @download_images    = options[:download_images]
+      @headers            = options[:headers]
+      @normalize_url      = options[:normalize_url]
+      @faraday_options    = options[:faraday_options]
+      @faraday_http_cache = options[:faraday_http_cache]
+      @url                = MetaInspector::URL.new(initial_url, normalize:          @normalize_url)
+      @request            = MetaInspector::Request.new(@url,    allow_redirections: @allow_redirections,
+                                                                connection_timeout: @connection_timeout,
+                                                                read_timeout:       @read_timeout,
+                                                                retries:            @retries,
+                                                                encoding:           @encoding,
+                                                                headers:            @headers,
+                                                                faraday_options:    @faraday_options,
+                                                                faraday_http_cache: @faraday_http_cache) unless @document
+      @parser             = MetaInspector::Parser.new(self,     download_images:    @download_images)
     end
 
     extend Forwardable
-    def_delegators :@url,     :url, :scheme, :host, :root_url
-    def_delegators :@request, :content_type
-    def_delegators :@parser,  :parsed, :respond_to?, :title, :description, :links, :internal_links, :external_links,
-                              :images, :image, :feed, :charset, :meta_tags, :meta_tag, :meta
+    delegate [:url, :scheme, :host, :root_url,
+              :tracked?, :untracked_url, :untrack!]   => :@url
+
+    delegate [:content_type, :response]               => :@request
+
+    delegate [:parsed, :title, :best_title, :author, :best_author,
+              :h1, :h2, :h3, :h4, :h5, :h6, :description, :best_description, :links,
+              :images, :feeds, :feed, :charset, :meta_tags,
+              :meta_tag, :meta, :favicon,
+              :head_links, :stylesheets, :canonicals] => :@parser
 
     # Returns all document data as a nested Hash
     def to_hash
       {
-        'url' => url,
-        'title' => title,
-        'links' => links,
-        'internal_links' => internal_links,
-        'external_links' => external_links,
-        'images' => images,
-        'charset' => charset,
-        'feed' => feed,
-        'content_type' => content_type,
-        'meta_tags' => meta_tags
+        'url'              => url,
+        'scheme'           => scheme,
+        'host'             => host,
+        'root_url'         => root_url,
+        'title'            => title,
+        'best_title'       => best_title,
+        'author'           => author,
+        'best_author'      => best_author,
+        'description'      => description,
+        'best_description' => best_description,
+        'h1'               => h1,
+        'h2'               => h2,
+        'h3'               => h3,
+        'h4'               => h4,
+        'h5'               => h5,
+        'h6'               => h6,
+        'links'            => links.to_hash,
+        'images'           => images.to_a,
+        'charset'          => charset,
+        'feed'             => feed,
+        'feeds'            => feeds,
+        'content_type'     => content_type,
+        'meta_tags'        => meta_tags,
+        'favicon'          => images.favicon,
+        'response'         => { 'status'  => response.status,
+                                'headers' => response.headers }
       }
     end
 
@@ -59,17 +93,29 @@ module MetaInspector
     private
 
     def defaults
-      { :timeout => 20, :html_content_only => false, :warn_level => :raise }
+      { :connection_timeout     => 20,
+        :read_timeout           => 20,
+        :retries                => 3,
+        :headers                => {
+                                     'User-Agent'      => default_user_agent,
+                                     'Accept-Encoding' => 'identity'
+                                  },
+        :allow_redirections     => true,
+        :allow_non_html_content => false,
+        :normalize_url          => true,
+        :download_images        => true }
+    end
+
+    def default_user_agent
+      "MetaInspector/#{MetaInspector::VERSION} (+https://github.com/jaimeiniesta/metainspector)"
     end
 
     def document
-      @document ||= if html_content_only && content_type != "text/html"
-                      raise "The url provided contains #{content_type} content instead of text/html content" and nil
-                    else
-                      @request.read
-                    end
-      rescue Exception => e
-        @exception_log << e
+      @document ||= if !allow_non_html_content && !content_type.nil? && content_type != 'text/html'
+        fail MetaInspector::NonHtmlError.new "The url provided contains #{content_type} content instead of text/html content"
+      else
+        @request.read
+      end
     end
   end
 end
